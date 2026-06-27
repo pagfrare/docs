@@ -1,0 +1,291 @@
+\chapter{ENTRADA E SAÍDA DE TECLADO}
+
+\chapterauthor{Matteo Cileneo Savan, Pedro Achilles Domingues Alves Pereira e Raul Yoshiyuki Komai}
+
+%-------------------------------------------------------------------------------
+\section{Descrição}
+%-------------------------------------------------------------------------------
+
+
+
+Uma parte fundamental em um sistema é o de entrada e saída de dados. Sem ele, o sistema ficaria incomunicável. Assim, esta seção se destinará a detalhar a implementação da entrada de dados do teclado e saída visual.
+
+Qualquer unidade de E/S contém dois componentes:
+\begin{itemize}
+    \item Mecânico: o dispositivo em si;
+    \item Eletrônico: a controladora de dispositivo. Ela tem alguns registradores para a comunicação com a CPU do computador e, a partir desses registradores, o sistema operacional será capaz de enviar e receber dados do dispositivo, ler status, entre outras coisas.
+\end{itemize}
+
+O foco da implementação deste módulo é lidar com a controladora dos dispositivos a partir da criação de um driver sem espera ocupada (com o uso de interrupções, no lugar), gerenciar os buffers de E/S de dados e implementar uma interatividade com o usuário por meio de uma shell para a execução de comandos simples.
+
+No QEMU, a controladora simulada é a PrimeCell UART (PL011), e ela servirá para a comunicação serial entre os dispositivos de E/S e o \textit{kernel}. Importante ressaltar que, aqui, não ocorre comunicação direta entre o teclado e o UART ou entre o UART e o monitor, essa operação tem intermédio do próprio QEMU \cite{ekasiswanto:qemu-uart}. A plataforma oferece uma interface para uso da controladora em baixo nível.
+
+
+
+%-------------------------------------------------------------------------------
+\section{Decisões de Arquitetura e Design}
+%-------------------------------------------------------------------------------
+
+
+    Foi tomada a decisão de projeto de manter uma alta coesão e baixo acoplamento, deixando o sistema mais modular e mais fácil de reparar ou modificar. Por conta disso, foi escolhido criar um arquivo (\texttt{uart.c}) com foco na implementação de funções básicas da UART e um arquivo de abstração da UART com foco maior em I/O (\texttt{kstdio.c}).
+
+    Também, no arquivo de implementação da uart.c houve a necessidade de escolher uma estrutura de dados para o \textit{buffer}, e a escolhida foi \textit{buffer} circular. Isso ocorreu porque ele permite armazenar dados continuamente usando um espaço fixo de memória e porque se trata de uma estrutura simples de implementar.
+
+    Era exigido que o projeto utilizasse um sistema de interrupção ao invés de \textit{pooling}, e é realmente a melhor estratégia porque dessa forma o processador fica liberado para executar outras tarefas ao invés de esperar a todo instante uma nova entrada de teclado.
+    
+
+
+
+
+%-------------------------------------------------------------------------------
+\section{Detalhes da Implementação}
+%-------------------------------------------------------------------------------
+
+
+\subsection{Arquivos e organização}
+
+Para a implementação foram utilizados:
+
+\begin{itemize}
+    
+    \item \texttt{kstudio.c}: é uma camada de abstração sobre as funcionalidades da UART. Assim, é um conjunto de funções para lidar com entrada e saída a partir das funções de \texttt{uart.c}. No projeto, é usada principalmente no interpretador de comandos \texttt{shell.c};
+    
+    \item \texttt{main.c}: realiza-se a inicialização geral do sistema;
+    
+    \item \texttt{shell.c}: arquivo de um shell simples para possibilitar receber e executar comandos básicos do usuário no terminal do QEMU;
+    
+    \item \texttt{uart.c}: contém toda a implementação do driver da UART emulada.
+\end{itemize}
+
+\subsection{Fluxo simplificado de execução}
+Podemos separar a execução em dois fluxos principais: fluxo de entrada e fluxo de saída. Abaixo segue a explicação de forma simplificada.
+
+\subsubsection{Fluxo de entrada}
+
+\begin{enumerate}
+    \item Teclado
+    \item Terminal serial do QEMU
+    \item Hardware UART emulado
+    \item Driver UART
+    \item Shell para o processamento do comando 
+\end{enumerate}
+
+Nesse fluxo, o usuário digita caracteres no teclado, o terminal serial do QEMU captura os dados e os encaminha para a UART emulada. O driver UART trata a interrupção de recepção, armazena os caracteres no \textit{buffer} de entrada e os disponibiliza para a \textit{shell} através da função \texttt{uart\_getc()}.
+
+\subsubsection{Fluxo de saída}
+
+\begin{enumerate}
+    \item Shell com sua saída processada
+    \item Driver UART
+    \item Hardware UART emulado
+    \item Terminal serial do QEMU
+\end{enumerate}
+
+No fluxo de saída, a \textit{shell} utiliza funções como \texttt{kprintf()}, \texttt{kputs()} e \texttt{kputc()} para enviar dados ao driver UART. Os caracteres são transmitidos pela UART emulada e exibidos no terminal serial do QEMU.
+
+\subsection{A entrada de dados por teclado}
+
+O teclado é um dispositivo de caractere, e, por conta disso, não trabalha em cima de leitura de escrita em blocos de tamanho fixo como acontece nos discos. Ele é um dispositivo que envia um fluxo de caracteres, sem considerar nenhuma estrutura de bloco.
+
+A partir da interface do UART \cite{jankovic:qemu-uart-interface} foi implementado um driver para lidar com a entrada de dados por teclado. A implementação dele utiliza os seguintes registradores \cite{arm:summary-registers} principais:
+
+\begin{itemize}
+    \item \texttt{UART0\_CR}: registrador com foco em ativar/desativar a UART, transmissão e recepção;
+    
+    \item \texttt{UART\_DR}: registrador de dados. Quando se escreve um valor aqui, este valor será lido pelo kernel;
+    
+    \item \texttt{UART\_FR}: registrador flag para controle de status UART.
+    \begin{itemize}
+        \item \texttt{RXFE}: um bit do registrador \texttt{UART\_FR} que, se first-in first-out (FIFO) estiver habilitado, será definido quando houver caracteres válidos para se transmitir. Caso ainda reste algum caractere, seu valor será 0.
+    \end{itemize}
+    
+    \item \texttt{UART0\_LCR\_H}: registrador de configuração da transmissão.
+    \begin{itemize}
+        \item \texttt{UART\_LCR\_FEN}: registrador para habilitar/desabilitar first-in first-out.
+    \end{itemize}
+    
+    \item \texttt{UART0\_IMSC}: registrador de máscara de interrupções. Ou seja, com ele conseguimos dizer quais interrupções queremos considerar e quais não queremos.
+    \begin{itemize}
+        \item \texttt{RXIM}: um bit do registrador \texttt{IMSC} que representa uma interrupção de recepção;
+        
+        \item \texttt{TXIM}: um outro bit do registrador \texttt{IMSC} que representa uma interrupção de transmissão.
+    \end{itemize}
+    
+    \item \texttt{UART0\_ICR}: registrador de limpeza de interrupções e só pode ser escrito;
+    
+    \item \texttt{UART0\_MIS}: registrador de status de interrupções mascaradas. É um registrador somente leitura que indica quais interrupções habilitadas encontram-se pendentes no momento;
+    
+    \item \texttt{UART0\_IBRD}: contém a parte inteira do valor do divisor da taxa de transmissão (baud rate);
+    
+    \item \texttt{UART0\_FBRD}: representa a parte fracionária do valor do divisor da taxa de transmissão (baud rate).
+\end{itemize}
+
+Dessa forma, o kernel conversa com a UART lendo e escrevendo nesses registradores.
+
+\subsection{Inicialização da UART}
+
+A inicialização da UART é realizada pela função \texttt{uart\_init()}. Durante esse processo:
+
+\begin{itemize}
+    \item a UART é temporariamente desabilitada;
+    
+    \item a taxa de transmissão (baud rate) é configurada a partir de \texttt{uart\_set\_baud\_rate()};
+    
+    \item o mecanismo FIFO é habilitado em \texttt{uart\_enable\_fifo()};
+    
+    \item interrupções de recepção são ativadas usando \texttt{uart\_enable\_interrupts()};
+    
+    \item a UART é reabilitada para transmissão e recepção.
+\end{itemize}
+
+Dessa forma o sistema fica configurado sem espera ocupada para recepção de caracteres, utilizando interrupções de hardware para notificar o kernel quando novos dados estiverem disponíveis.
+
+\subsection{Tratamento de interrupções}
+
+Quando um caractere é digitado no terminal do QEMU, a UART emulada atualiza seus registradores internos e gera uma interrupção de recepção. Então o sistema de interrupção chama a \texttt{uart\_irq\_handler(void)} para tratar isso. Ela realiza:
+
+\begin{itemize}
+    \item reconhecimento das interrupções analisando \texttt{UART0\_MIS};
+    
+    \item limpeza da interrupção pendente usando o registrador \texttt{UART0\_ICR};
+    
+    \item leitura dos caracteres presentes no registrador de dados \texttt{UART\_DR};
+    
+    \item armazenamento dos caracteres em um buffer circular usando \texttt{uart\_buffer\_push()}. O armazenamento é realizado enquanto existirem caracteres válidos na \texttt{UART\_DR}.
+\end{itemize}
+
+\subsection{Buffer circular}
+
+Para armazenamento temporário dos caracteres recebidos foi implementado um buffer em formato de fila circular (\texttt{ring\_buffer\_t}). Essa estrutura é formada por:
+
+\begin{itemize}
+    \item vetor de caracteres (\texttt{char buffer[]});
+    
+    \item índice de escrita (\texttt{volatile uint32\_t head});
+    
+    \item índice de leitura (\texttt{volatile uint32\_t tail}).
+\end{itemize}
+
+E, a partir dessa estrutura, cria-se \texttt{rx\_buffer} para fazer uso de armazenamento dos caracteres no driver UART usando as funções:
+
+\begin{itemize}
+    \item \texttt{static int uart\_buffer\_push(char c)}: responsável por inserir o caractere \texttt{c} no buffer. Retorna 1 caso sucesso e 0 caso contrário;
+    
+    \item \texttt{static int uart\_buffer\_pop(char *ptr)}: responsável por remover caractere do buffer e inseri-lo no ponteiro \texttt{ptr} passado como parâmetro. Retorna \texttt{1} caso sucesso e \texttt{0} caso contrário.
+\end{itemize}
+
+\subsection{A saída de dados no monitor}
+	O monitor também é tratado como um dispositivo de caractere e, no contexto do projeto, a exibição textual também é realizada através da UART PL011 emulada pelo QEMU, que encaminha os caracteres transmitidos pelo kernel para o terminal.
+
+
+
+%-------------------------------------------------------------------------------
+\section{Interface Pública (API)}
+%-------------------------------------------------------------------------------
+
+
+Foram disponibilizadas duas APIs. Elas são importantes para uso no módulo de entrada e saída de teclado e também poderão ser usadas por outros módulos. Elas são:
+
+\subsection{API da UART}
+Aqui tem-se uma API da uart em um nível mais baixo, mais próximo ao hardware simulado. Ela contém as funções:
+\begin{itemize}
+    \item \texttt{void uart\_init(void)}\\
+    Inicializa e configura a UART PL011 para comunicação serial. Durante a inicialização, a UART é temporariamente desabilitada, a taxa de transmissão é configurada, o FIFO é habilitado e as interrupções de recepção são ativadas. Ao final, a UART é reabilitada para transmissão e recepção.
+
+    \item \texttt{void uart\_putc(char c)}\\
+    Transmite um único caractere \texttt{c} passado como argumento para a UART. A função trata automaticamente o caractere \texttt{\textbackslash n}, realizando sua conversão para \texttt{\textbackslash r\textbackslash n} para compatibilidade com o terminal serial. Antes da transmissão, a função aguarda até que exista espaço disponível no FIFO de transmissão da UART e então escreve o caractere no registrador de dados \texttt{UART\_DR}. 
+
+    \item \texttt{void uart\_puts(const char *str)}\\
+    Transmite uma sequência de caracteres, sequência esta passada por parâmetro como ponteiro de caracteres str. Ele percorre o vetor referenciado por str até encontrar o caractere \texttt{\textbackslash n} e finalizar a transmissão.
+
+    \item \texttt{char uart\_getc(void)}\\
+    Função sem parâmetros que retorna um caractere que foi recebido e transmitido pela UART. Ele funciona como uma interface pública de leitura do que a UART transmite. 
+
+    \item \texttt{void uart\_irq\_handler(void)}\\
+    Função sem parâmetros que deve ser chamada pelo sistema de interrupção (GIC) caso o id de interrupção for \texttt{33}. Ao ser chamada, se inicia uma rotina de tratamento de interrupções da UART.
+    
+\end{itemize}
+
+\subsection{API da UART com foco em entrada e saída}
+No arquivo kstdio.c tem-se uma abstração de funcionalidades da UART voltada para processar comandos de I/O no terminal e, para isto, faz uso da API da UART. Ela contém as funções para uso:
+
+\begin{itemize}
+
+    \item \texttt{void ksdtio\_init(void)}\\
+    Inicializa o subsistema básico de entrada e saída do kernel através da inicialização da UART.
+
+    \item \texttt{void kputs(const char *str)}\\
+    Envia uma string para a saída serial utilizando a UART. Recebe como parâmetro um ponteiro para os caracteres que serão transmitidos
+
+
+    \item \texttt{void kputc(char c)}\\
+    Envia um único caractere \texttt{c} passado como parâmetro para a saída serial utilizando a UART.
+
+
+    \item \texttt{char kgetc(void)}\\
+    Função sem parâmetros que retorna um caractere que foi recebido e transmitido pela UART. Ele funciona como uma interface pública de leitura do que a UART transmite. 
+
+    \item \texttt{char kgets(char *buf, int max\_len)}\\
+    Função que recebe como parâmetro um ponteiro para o buffer que irá receber a \textit{string} transmitida pela UART e o tamanho máximo do buffer. Também é como uma interface pública de leitura do que a UART transmite. 
+
+    \item \texttt{void kprintf(const char *format, ...)}\\
+    Contém uma implementação responsável pela impressão formatada no kernel. Ela recebe uma string de formatação (\texttt{format}), que pode conter texto comum ou especificadores iniciados por \texttt{\%}, além de seus respectivos valores para substituição. A função converte os valores para representação textual quando necessário e envia os caracteres resultantes através da UART. É semelhante à função \texttt{printf()} da biblioteca \texttt{stdio.h}.
+
+    Os especificadores suportados são:
+    \begin{itemize}
+        \item \texttt{\%c}: caractere;
+        \item \texttt{\%s}: string;
+        \item \texttt{\%d}: inteiro decimal com sinal;
+        \item \texttt{\%u}: inteiro decimal sem sinal;
+        \item \texttt{\%x}: inteiro hexadecimal;
+        \item \texttt{\%\textit{n}f}: número flutuante, com \textit{n} sendo o número de casas decimais;
+        \item \texttt{\%\%}: caractere \texttt{\%}.
+    \end{itemize}
+
+
+\end{itemize}
+
+
+%-------------------------------------------------------------------------------
+\section{Testes e Verificação}
+%-------------------------------------------------------------------------------
+
+
+Para entender o processo de validação é importante entender o arquivo shell.c. Ele implementa uma interface de linha de comando simples para interação com o kernel através da UART. Seu funcionamento é baseado em um laço infinito responsável por receber comandos digitados pelo usuário, processá-los e executar ações correspondentes.
+
+Inicialmente, a shell exibe mensagens de boas-vindas utilizando a função \texttt{kprintf()}. Em seguida, entra em modo interativo, exibindo continuamente o prompt \texttt{\$} e aguardando caracteres recebidos pela função \texttt{kgetc()}.
+
+Os caracteres digitados são armazenados no buffer \texttt{cmd\_buffer}. O sistema também realiza tratamento de caracteres especiais, como \textit{Enter}, utilizado para finalizar o comando, e \textit{Backspace}, utilizado para apagar caracteres digitados anteriormente. Caracteres imprimíveis são armazenados no buffer e imediatamente reenviados ao terminal utilizando \texttt{kputc()}, permitindo o efeito de eco no terminal serial.
+
+Após o recebimento completo do comando, a \textit{shell} realiza um processo de tokenização, separando a entrada em argumentos com base em espaços. Os argumentos encontrados são armazenados no vetor \texttt{argv}, enquanto a variável \texttt{argc} mantém a quantidade de argumentos identificados.
+
+O processamento dos comandos é realizado por meio de comparações utilizando a função \texttt{strcmp()}. Entre os comandos implementados estão:
+
+\begin{itemize}
+    \item \texttt{help}: exibe os comandos disponíveis;
+    \item \texttt{clear}: limpa o terminal utilizando sequências ANSI;
+    \item \texttt{echo}: imprime novamente os argumentos digitados pelo usuário;
+    \item \texttt{kprintf}: executa testes da função de impressão formatada.
+\end{itemize}
+
+A implementação da shell permitiu validar de forma prática o funcionamento da UART, das rotinas de entrada e saída de caracteres, do buffer de comandos, do parser de argumentos e da função \texttt{kprintf()}.
+
+A validação do módulo foi realizada por meio da execução de testes com comandos simples no terminal do QEMU  que foram implementados no arquivo \texttt{shell.c}, permitindo verificar o funcionamento das rotinas de entrada e saída do kernel, especialmente as funções relacionadas à UART e ao módulo de impressão formatada (\texttt{kprintf})
+
+A função \texttt{kgetc()} foi utilizada para capturar caracteres recebidos pela UART, enquanto as funções \texttt{kputc()}, \texttt{kputs()} e \texttt{kprintf()} foram utilizadas para enviar dados ao terminal.
+
+Para testagem, foram usados comandos:
+
+\begin{itemize}
+    \item \texttt{help}: faz a verificação da impressão de múltiplas linhas formatadas usando \texttt{kprintf()};
+    
+    \item \texttt{clear}: valida o envio de sequências ANSI pela UART utilizando a função \texttt{kputs()}, pois, para limpar o terminal, é necessário enviar a sequência de escape \texttt{\textbackslash033[2J\textbackslash033[H]}.
+    
+    \item \texttt{echo}: faz a reprodução de texto digitado. Funciona da seguinte maneira: o arquivo shell.c possui um buffer onde os caracteres digitados são armazenados até que a tecla Enter seja pressionada. Então a linha é tokenizada e os argumentos fornecidos após o comando são enviados para a função kprintf(), que realiza a transmissão textual através da UART, fazendo com que o texto seja exibido novamente no terminal serial do QEMU.
+    
+    \item \texttt{kprintf}: realiza testes de impressão formatada de um texto com diferentes especificadores, incluindo \texttt{\%s}, \texttt{\%c}, \texttt{\%d} e \texttt{\%x}.
+\end{itemize}
+
+Durante os testes, foi possível confirmar o funcionamento correto da comunicação serial, do buffer circular de recepção, da leitura de caracteres, do \textit{parser} de comandos e da conversão de valores numéricos para representação textual.
+
+
